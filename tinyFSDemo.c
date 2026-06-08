@@ -19,6 +19,7 @@ int main(void) {
     int result;
     fileDescriptor fd;
     char message[] = "hello tiny file system";
+    char newMessage[] = "new writable content";
 
     printf("Creating TinyFS disk...\n");
     result = tfs_mkfs(DEFAULT_DISK_NAME, DEFAULT_DISK_SIZE);
@@ -65,6 +66,38 @@ int main(void) {
     tfs_readdir();
 
     printf("Reading after rename: ");
+    readWholeFile(fd);
+
+    printf("Making file2 read-only...\n");
+    result = tfs_makeRO("file2");
+    if (result < 0) {
+        printf("tfs_makeRO failed: %d\n", result);
+        return 1;
+    }
+
+    printf("Trying to write while read-only...\n");
+    result = tfs_writeFile(fd, newMessage, strlen(newMessage));
+    printf("Write result while read-only should be negative: %d\n", result);
+
+    printf("Trying to delete while read-only...\n");
+    result = tfs_deleteFile(fd);
+    printf("Delete result while read-only should be negative: %d\n", result);
+
+    printf("Making file2 read-write again...\n");
+    result = tfs_makeRW("file2");
+    if (result < 0) {
+        printf("tfs_makeRW failed: %d\n", result);
+        return 1;
+    }
+
+    printf("Writing after making read-write: %s\n", newMessage);
+    result = tfs_writeFile(fd, newMessage, strlen(newMessage));
+    if (result < 0) {
+        printf("tfs_writeFile after RW failed: %d\n", result);
+        return 1;
+    }
+
+    printf("Reading after RW write: ");
     readWholeFile(fd);
 
     printf("Deleting file2...\n");

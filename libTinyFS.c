@@ -11,6 +11,8 @@
 #define INODE_NAME_START 4
 #define INODE_SIZE_START 12
 #define INODE_DATA_START 16
+#define INODE_RO_FLAG 20
+
 #define DATA_BYTES_PER_BLOCK 252
 
 typedef struct {
@@ -79,6 +81,14 @@ static int getFirstDataBlock(char inode[BLOCKSIZE]) {
 
 static void setFirstDataBlock(char inode[BLOCKSIZE], int blockNum) {
     memcpy(&inode[INODE_DATA_START], &blockNum, sizeof(int));
+}
+
+static int isReadOnly(char inode[BLOCKSIZE]) {
+    return inode[INODE_RO_FLAG] == 1;
+}
+
+static void setReadOnly(char inode[BLOCKSIZE], int value) {
+    inode[INODE_RO_FLAG] = value;
 }
 
 static int getFreeBlock(void) {
@@ -315,6 +325,7 @@ fileDescriptor tfs_openFile(char *name) {
         strcpy(&inode[INODE_NAME_START], name);
         setFileSize(inode, 0);
         setFirstDataBlock(inode, NO_BLOCK);
+        setReadOnly(inode, 0);
 
         if (writeBlock(mountedDisk, inodeBlock, inode) < 0) {
             return TFS_ERR_DISK;
@@ -376,6 +387,10 @@ int tfs_writeFile(fileDescriptor FD, char *buffer, int size) {
 
     if (readBlock(mountedDisk, openFiles[FD].inodeBlock, inode) < 0) {
         return TFS_ERR_DISK;
+    }
+
+    if (isReadOnly(inode)) {
+        return TFS_ERR_GENERAL;
     }
 
     oldFirstDataBlock = getFirstDataBlock(inode);
@@ -457,6 +472,10 @@ int tfs_deleteFile(fileDescriptor FD) {
 
     if (readBlock(mountedDisk, openFiles[FD].inodeBlock, inode) < 0) {
         return TFS_ERR_DISK;
+    }
+
+    if (isReadOnly(inode)) {
+        return TFS_ERR_GENERAL;
     }
 
     firstDataBlock = getFirstDataBlock(inode);
@@ -613,6 +632,68 @@ int tfs_rename(fileDescriptor FD, char *newName) {
     strcpy(&inode[INODE_NAME_START], newName);
 
     if (writeBlock(mountedDisk, openFiles[FD].inodeBlock, inode) < 0) {
+        return TFS_ERR_DISK;
+    }
+
+    return TFS_SUCCESS;
+}
+
+int tfs_makeRO(char *name) {
+    char inode[BLOCKSIZE];
+    int inodeBlock;
+
+    if (!isMounted) {
+        return TFS_ERR_NOT_MOUNTED;
+    }
+
+    if (!isValidName(name)) {
+        return TFS_ERR_BAD_NAME;
+    }
+
+    inodeBlock = findInodeByName(name);
+
+    if (inodeBlock < 0) {
+        return TFS_ERR_GENERAL;
+    }
+
+    if (readBlock(mountedDisk, inodeBlock, inode) < 0) {
+        return TFS_ERR_DISK;
+    }
+
+    setReadOnly(inode, 1);
+
+    if (writeBlock(mountedDisk, inodeBlock, inode) < 0) {
+        return TFS_ERR_DISK;
+    }
+
+    return TFS_SUCCESS;
+}
+
+int tfs_makeRW(char *name) {
+    char inode[BLOCKSIZE];
+    int inodeBlock;
+
+    if (!isMounted) {
+        return TFS_ERR_NOT_MOUNTED;
+    }
+
+    if (!isValidName(name)) {
+        return TFS_ERR_BAD_NAME;
+    }
+
+    inodeBlock = findInodeByName(name);
+
+    if (inodeBlock < 0) {
+        return TFS_ERR_GENERAL;
+    }
+
+    if (readBlock(mountedDisk, inodeBlock, inode) < 0) {
+        return TFS_ERR_DISK;
+    }
+
+    setReadOnly(inode, 0);
+
+    if (writeBlock(mountedDisk, inodeBlock, inode) < 0) {
         return TFS_ERR_DISK;
     }
 

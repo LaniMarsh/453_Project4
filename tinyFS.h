@@ -27,6 +27,8 @@ int tfs_mount(char *diskname);
 int tfs_unmount(void);
 int tfs_readdir(void);
 int tfs_rename(fileDescriptor FD, char *newName);
+int tfs_makeRO(char *name);
+int tfs_makeRW(char *name);
 
 fileDescriptor tfs_openFile(char *name);
 int tfs_closeFile(fileDescriptor FD);
