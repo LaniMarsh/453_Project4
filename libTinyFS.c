@@ -11,6 +11,7 @@
 #define INODE_NAME_START 4
 #define INODE_SIZE_START 12
 #define INODE_DATA_START 16
+#define DATA_BYTES_PER_BLOCK 252
 
 typedef struct {
     int inUse;
@@ -62,9 +63,7 @@ static int isValidName(char *name) {
 
 static int getFileSize(char inode[BLOCKSIZE]) {
     int size = 0;
-
     memcpy(&size, &inode[INODE_SIZE_START], sizeof(int));
-
     return size;
 }
 
@@ -74,9 +73,7 @@ static void setFileSize(char inode[BLOCKSIZE], int size) {
 
 static int getFirstDataBlock(char inode[BLOCKSIZE]) {
     int blockNum = 0;
-
     memcpy(&blockNum, &inode[INODE_DATA_START], sizeof(int));
-
     return blockNum;
 }
 
@@ -133,6 +130,30 @@ static int returnBlockToFreeList(int blockNum) {
 
     if (writeBlock(mountedDisk, 0, super) < 0) {
         return TFS_ERR_DISK;
+    }
+
+    return TFS_SUCCESS;
+}
+
+static int freeDataBlocks(int firstDataBlock) {
+    char block[BLOCKSIZE];
+    int current;
+    int next;
+
+    current = firstDataBlock;
+
+    while (current != NO_BLOCK) {
+        if (readBlock(mountedDisk, current, block) < 0) {
+            return TFS_ERR_DISK;
+        }
+
+        next = (unsigned char)block[BYTE_LINK];
+
+        if (returnBlockToFreeList(current) < 0) {
+            return TFS_ERR_DISK;
+        }
+
+        current = next;
     }
 
     return TFS_SUCCESS;
@@ -331,6 +352,15 @@ int tfs_closeFile(fileDescriptor FD) {
 
 int tfs_writeFile(fileDescriptor FD, char *buffer, int size) {
     char inode[BLOCKSIZE];
+    char dataBlock[BLOCKSIZE];
+
+    int oldFirstDataBlock;
+    int firstNewDataBlock;
+    int previousDataBlock;
+    int currentDataBlock;
+
+    int bytesWritten;
+    int bytesToCopy;
 
     if (!isMounted) {
         return TFS_ERR_NOT_MOUNTED;
@@ -348,24 +378,91 @@ int tfs_writeFile(fileDescriptor FD, char *buffer, int size) {
         return TFS_ERR_DISK;
     }
 
+    oldFirstDataBlock = getFirstDataBlock(inode);
+
+    if (freeDataBlocks(oldFirstDataBlock) < 0) {
+        return TFS_ERR_DISK;
+    }
+
+    firstNewDataBlock = NO_BLOCK;
+    previousDataBlock = NO_BLOCK;
+    bytesWritten = 0;
+
+    while (bytesWritten < size) {
+        currentDataBlock = getFreeBlock();
+
+        if (currentDataBlock < 0) {
+            return currentDataBlock;
+        }
+
+        initBlock(dataBlock, BLOCK_DATA);
+
+        bytesToCopy = size - bytesWritten;
+
+        if (bytesToCopy > DATA_BYTES_PER_BLOCK) {
+            bytesToCopy = DATA_BYTES_PER_BLOCK;
+        }
+
+        memcpy(&dataBlock[BYTE_DATA], &buffer[bytesWritten], bytesToCopy);
+
+        if (firstNewDataBlock == NO_BLOCK) {
+            firstNewDataBlock = currentDataBlock;
+        }
+
+        if (previousDataBlock != NO_BLOCK) {
+            char previousBlock[BLOCKSIZE];
+
+            if (readBlock(mountedDisk, previousDataBlock, previousBlock) < 0) {
+                return TFS_ERR_DISK;
+            }
+
+            previousBlock[BYTE_LINK] = currentDataBlock;
+
+            if (writeBlock(mountedDisk, previousDataBlock, previousBlock) < 0) {
+                return TFS_ERR_DISK;
+            }
+        }
+
+        if (writeBlock(mountedDisk, currentDataBlock, dataBlock) < 0) {
+            return TFS_ERR_DISK;
+        }
+
+        previousDataBlock = currentDataBlock;
+        bytesWritten += bytesToCopy;
+    }
+
     setFileSize(inode, size);
-    setFirstDataBlock(inode, NO_BLOCK);
-    openFiles[FD].filePointer = 0;
+    setFirstDataBlock(inode, firstNewDataBlock);
 
     if (writeBlock(mountedDisk, openFiles[FD].inodeBlock, inode) < 0) {
         return TFS_ERR_DISK;
     }
 
+    openFiles[FD].filePointer = 0;
+
     return TFS_SUCCESS;
 }
 
 int tfs_deleteFile(fileDescriptor FD) {
+    char inode[BLOCKSIZE];
+    int firstDataBlock;
+
     if (!isMounted) {
         return TFS_ERR_NOT_MOUNTED;
     }
 
     if (FD < 0 || FD >= MAX_OPEN_FILES || !openFiles[FD].inUse) {
         return TFS_ERR_BAD_FD;
+    }
+
+    if (readBlock(mountedDisk, openFiles[FD].inodeBlock, inode) < 0) {
+        return TFS_ERR_DISK;
+    }
+
+    firstDataBlock = getFirstDataBlock(inode);
+
+    if (freeDataBlocks(firstDataBlock) < 0) {
+        return TFS_ERR_DISK;
     }
 
     if (returnBlockToFreeList(openFiles[FD].inodeBlock) < 0) {
@@ -381,7 +478,15 @@ int tfs_deleteFile(fileDescriptor FD) {
 
 int tfs_readByte(fileDescriptor FD, char *buffer) {
     char inode[BLOCKSIZE];
+    char dataBlock[BLOCKSIZE];
+
     int fileSize;
+    int firstDataBlock;
+    int currentDataBlock;
+
+    int targetOffset;
+    int blockOffset;
+    int byteOffsetInsideBlock;
 
     if (!isMounted) {
         return TFS_ERR_NOT_MOUNTED;
@@ -405,7 +510,31 @@ int tfs_readByte(fileDescriptor FD, char *buffer) {
         return TFS_ERR_EOF;
     }
 
-    *buffer = 0;
+    firstDataBlock = getFirstDataBlock(inode);
+    currentDataBlock = firstDataBlock;
+
+    targetOffset = openFiles[FD].filePointer;
+    blockOffset = targetOffset / DATA_BYTES_PER_BLOCK;
+    byteOffsetInsideBlock = targetOffset % DATA_BYTES_PER_BLOCK;
+
+    for (int i = 0; i < blockOffset; i++) {
+        if (readBlock(mountedDisk, currentDataBlock, dataBlock) < 0) {
+            return TFS_ERR_DISK;
+        }
+
+        currentDataBlock = (unsigned char)dataBlock[BYTE_LINK];
+
+        if (currentDataBlock == NO_BLOCK) {
+            return TFS_ERR_DISK;
+        }
+    }
+
+    if (readBlock(mountedDisk, currentDataBlock, dataBlock) < 0) {
+        return TFS_ERR_DISK;
+    }
+
+    *buffer = dataBlock[BYTE_DATA + byteOffsetInsideBlock];
+
     openFiles[FD].filePointer++;
 
     return TFS_SUCCESS;
@@ -425,6 +554,67 @@ int tfs_seek(fileDescriptor FD, int offset) {
     }
 
     openFiles[FD].filePointer = offset;
+
+    return TFS_SUCCESS;
+}
+
+int tfs_readdir(void) {
+    char block[BLOCKSIZE];
+    int foundAny = 0;
+
+    if (!isMounted) {
+        return TFS_ERR_NOT_MOUNTED;
+    }
+
+    printf("Files on TinyFS disk:\n");
+
+    for (int i = 1; i < 256; i++) {
+        if (readBlock(mountedDisk, i, block) < 0) {
+            break;
+        }
+
+        if ((unsigned char)block[BYTE_TYPE] == BLOCK_INODE) {
+            printf("  %s\n", &block[INODE_NAME_START]);
+            foundAny = 1;
+        }
+    }
+
+    if (!foundAny) {
+        printf("  <empty>\n");
+    }
+
+    return TFS_SUCCESS;
+}
+
+int tfs_rename(fileDescriptor FD, char *newName) {
+    char inode[BLOCKSIZE];
+
+    if (!isMounted) {
+        return TFS_ERR_NOT_MOUNTED;
+    }
+
+    if (FD < 0 || FD >= MAX_OPEN_FILES || !openFiles[FD].inUse) {
+        return TFS_ERR_BAD_FD;
+    }
+
+    if (!isValidName(newName)) {
+        return TFS_ERR_BAD_NAME;
+    }
+
+    if (findInodeByName(newName) >= 0) {
+        return TFS_ERR_GENERAL;
+    }
+
+    if (readBlock(mountedDisk, openFiles[FD].inodeBlock, inode) < 0) {
+        return TFS_ERR_DISK;
+    }
+
+    memset(&inode[INODE_NAME_START], 0, MAX_FILENAME);
+    strcpy(&inode[INODE_NAME_START], newName);
+
+    if (writeBlock(mountedDisk, openFiles[FD].inodeBlock, inode) < 0) {
+        return TFS_ERR_DISK;
+    }
 
     return TFS_SUCCESS;
 }

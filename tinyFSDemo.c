@@ -1,13 +1,26 @@
 #include <stdio.h>
+#include <string.h>
 
 #include "tinyFS.h"
+
+static void readWholeFile(fileDescriptor fd) {
+    char c;
+
+    tfs_seek(fd, 0);
+
+    while (tfs_readByte(fd, &c) == TFS_SUCCESS) {
+        putchar(c);
+    }
+
+    putchar('\n');
+}
 
 int main(void) {
     int result;
     fileDescriptor fd;
+    char message[] = "hello tiny file system";
 
     printf("Creating TinyFS disk...\n");
-
     result = tfs_mkfs(DEFAULT_DISK_NAME, DEFAULT_DISK_SIZE);
     if (result < 0) {
         printf("tfs_mkfs failed: %d\n", result);
@@ -15,34 +28,70 @@ int main(void) {
     }
 
     printf("Mounting TinyFS disk...\n");
-
     result = tfs_mount(DEFAULT_DISK_NAME);
     if (result < 0) {
         printf("tfs_mount failed: %d\n", result);
         return 1;
     }
 
-    printf("TinyFS mounted successfully.\n");
-
-    printf("Opening file named file1...\n");
-
+    printf("Opening file1...\n");
     fd = tfs_openFile("file1");
     if (fd < 0) {
         printf("tfs_openFile failed: %d\n", fd);
         return 1;
     }
 
-    printf("file1 opened with FD %d\n", fd);
+    printf("Writing: %s\n", message);
+    result = tfs_writeFile(fd, message, strlen(message));
+    if (result < 0) {
+        printf("tfs_writeFile failed: %d\n", result);
+        return 1;
+    }
+
+    printf("Reading before rename: ");
+    readWholeFile(fd);
+
+    printf("Directory listing before rename:\n");
+    tfs_readdir();
+
+    printf("Renaming file1 to file2...\n");
+    result = tfs_rename(fd, "file2");
+    if (result < 0) {
+        printf("tfs_rename failed: %d\n", result);
+        return 1;
+    }
+
+    printf("Directory listing after rename:\n");
+    tfs_readdir();
+
+    printf("Reading after rename: ");
+    readWholeFile(fd);
+
+    printf("Deleting file2...\n");
+    result = tfs_deleteFile(fd);
+    if (result < 0) {
+        printf("tfs_deleteFile failed: %d\n", result);
+        return 1;
+    }
+
+    printf("Reopening file1 after delete...\n");
+    fd = tfs_openFile("file1");
+    if (fd < 0) {
+        printf("tfs_openFile failed after delete: %d\n", fd);
+        return 1;
+    }
+
+    printf("Reading new file1 should be empty: ");
+    readWholeFile(fd);
+
+    printf("Directory listing after reopening file1:\n");
+    tfs_readdir();
 
     result = tfs_closeFile(fd);
     if (result < 0) {
         printf("tfs_closeFile failed: %d\n", result);
         return 1;
     }
-
-    printf("file1 closed successfully.\n");
-
-    printf("Unmounting TinyFS disk...\n");
 
     result = tfs_unmount();
     if (result < 0) {

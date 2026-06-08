@@ -25,6 +25,8 @@ typedef int fileDescriptor;
 int tfs_mkfs(char *filename, int nBytes);
 int tfs_mount(char *diskname);
 int tfs_unmount(void);
+int tfs_readdir(void);
+int tfs_rename(fileDescriptor FD, char *newName);
 
 fileDescriptor tfs_openFile(char *name);
 int tfs_closeFile(fileDescriptor FD);
