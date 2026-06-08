@@ -1,111 +1,182 @@
+#define _XOPEN_SOURCE 700
 #include "libDisk.h"
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <unistd.h>
 #include <fcntl.h>
-#include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #define MAX_DISKS 16
 
-static int diskFDs[MAX_DISKS] = {-1};
+static int diskFDs[MAX_DISKS];
+static int diskSizes[MAX_DISKS];
+static int initialized = 0;
 
-static int getFreeSlot(void) {
-    for (int i = 0; i < MAX_DISKS; i++) {
-        if (diskFDs[i] == -1)
-            return i;
+static void initDiskTable(void) {
+    if (initialized) {
+        return;
     }
 
-    return -1;
+    for (int i = 0; i < MAX_DISKS; i++) {
+        diskFDs[i] = -1;
+        diskSizes[i] = 0;
+    }
+
+    initialized = 1;
+}
+
+static int getFreeSlot(void) {
+    initDiskTable();
+
+    for (int i = 0; i < MAX_DISKS; i++) {
+        if (diskFDs[i] == -1) {
+            return i;
+        }
+    }
+
+    return DISK_ERR_NO_SPACE;
+}
+
+static int isValidDisk(int disk) {
+    initDiskTable();
+
+    if (disk < 0 || disk >= MAX_DISKS) {
+        return 0;
+    }
+
+    return diskFDs[disk] != -1;
+}
+
+static int isValidBlock(int disk, int bNum) {
+    int offset;
+
+    if (bNum < 0) {
+        return 0;
+    }
+
+    offset = bNum * BLOCKSIZE;
+
+    return offset + BLOCKSIZE <= diskSizes[disk];
 }
 
 int openDisk(char *filename, int nBytes) {
-    int slot = getFreeSlot();
-
-    if (slot < 0)
-        return -1;
-
     int fd;
+    int slot;
+    int usableSize;
+
+    if (filename == 0) {
+        return DISK_ERR_GENERAL;
+    }
+
+    slot = getFreeSlot();
+    if (slot < 0) {
+        return slot;
+    }
 
     if (nBytes == 0) {
+        struct stat fileInfo;
+
         fd = open(filename, O_RDWR);
+        if (fd < 0) {
+            return DISK_ERR_IO;
+        }
 
-        if (fd < 0)
-            return -1;
-    } else {
-        if (nBytes < BLOCKSIZE)
-            return -1;
-
-        int size = (nBytes / BLOCKSIZE) * BLOCKSIZE;
-
-        fd = open(filename,
-                  O_RDWR | O_CREAT | O_TRUNC,
-                  0666);
-
-        if (fd < 0)
-            return -1;
-
-        if (ftruncate(fd, size) < 0) {
+        if (fstat(fd, &fileInfo) < 0) {
             close(fd);
-            return -1;
+            return DISK_ERR_IO;
+        }
+
+        usableSize = ((int)fileInfo.st_size / BLOCKSIZE) * BLOCKSIZE;
+        if (usableSize < BLOCKSIZE) {
+            close(fd);
+            return DISK_ERR_BAD_SIZE;
+        }
+    } else {
+        if (nBytes < BLOCKSIZE) {
+            return DISK_ERR_BAD_SIZE;
+        }
+
+        usableSize = (nBytes / BLOCKSIZE) * BLOCKSIZE;
+
+        fd = open(filename, O_RDWR | O_CREAT | O_TRUNC, 0666);
+        if (fd < 0) {
+            return DISK_ERR_IO;
+        }
+
+        if (ftruncate(fd, usableSize) < 0) {
+            close(fd);
+            return DISK_ERR_IO;
         }
     }
 
     diskFDs[slot] = fd;
+    diskSizes[slot] = usableSize;
+
     return slot;
 }
 
 int closeDisk(int disk) {
-    if (disk < 0 || disk >= MAX_DISKS)
-        return -1;
+    if (!isValidDisk(disk)) {
+        return DISK_ERR_BAD_DISK;
+    }
 
-    if (diskFDs[disk] == -1)
-        return -1;
+    if (close(diskFDs[disk]) < 0) {
+        return DISK_ERR_IO;
+    }
 
-    close(diskFDs[disk]);
     diskFDs[disk] = -1;
+    diskSizes[disk] = 0;
 
-    return 0;
+    return DISK_SUCCESS;
 }
 
 int readBlock(int disk, int bNum, void *block) {
-    if (disk < 0 || disk >= MAX_DISKS)
-        return -1;
+    off_t offset;
+    ssize_t bytesRead;
 
-    if (diskFDs[disk] == -1)
-        return -1;
+    if (!isValidDisk(disk)) {
+        return DISK_ERR_BAD_DISK;
+    }
 
-    off_t offset = (off_t)bNum * BLOCKSIZE;
+    if (block == 0 || !isValidBlock(disk, bNum)) {
+        return DISK_ERR_BAD_BLOCK;
+    }
 
-    if (lseek(diskFDs[disk], offset, SEEK_SET) < 0)
-        return -1;
+    offset = (off_t)bNum * BLOCKSIZE;
 
-    ssize_t bytesRead =
-        read(diskFDs[disk], block, BLOCKSIZE);
+    if (lseek(diskFDs[disk], offset, SEEK_SET) < 0) {
+        return DISK_ERR_IO;
+    }
 
-    if (bytesRead != BLOCKSIZE)
-        return -1;
+    bytesRead = read(diskFDs[disk], block, BLOCKSIZE);
+    if (bytesRead != BLOCKSIZE) {
+        return DISK_ERR_IO;
+    }
 
-    return 0;
+    return DISK_SUCCESS;
 }
 
 int writeBlock(int disk, int bNum, void *block) {
-    if (disk < 0 || disk >= MAX_DISKS)
-        return -1;
+    off_t offset;
+    ssize_t bytesWritten;
 
-    if (diskFDs[disk] == -1)
-        return -1;
+    if (!isValidDisk(disk)) {
+        return DISK_ERR_BAD_DISK;
+    }
 
-    off_t offset = (off_t)bNum * BLOCKSIZE;
+    if (block == 0 || !isValidBlock(disk, bNum)) {
+        return DISK_ERR_BAD_BLOCK;
+    }
 
-    if (lseek(diskFDs[disk], offset, SEEK_SET) < 0)
-        return -1;
+    offset = (off_t)bNum * BLOCKSIZE;
 
-    ssize_t bytesWritten =
-        write(diskFDs[disk], block, BLOCKSIZE);
+    if (lseek(diskFDs[disk], offset, SEEK_SET) < 0) {
+        return DISK_ERR_IO;
+    }
 
-    if (bytesWritten != BLOCKSIZE)
-        return -1;
+    bytesWritten = write(diskFDs[disk], block, BLOCKSIZE);
+    if (bytesWritten != BLOCKSIZE) {
+        return DISK_ERR_IO;
+    }
 
-    return 0;
+    return DISK_SUCCESS;
 }
