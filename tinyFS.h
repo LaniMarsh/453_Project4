@@ -35,6 +35,7 @@ int tfs_closeFile(fileDescriptor FD);
 int tfs_writeFile(fileDescriptor FD, char *buffer, int size);
 int tfs_deleteFile(fileDescriptor FD);
 int tfs_readByte(fileDescriptor FD, char *buffer);
+int tfs_writeByte(fileDescriptor FD, unsigned int data);
 int tfs_seek(fileDescriptor FD, int offset);
 
 #endif

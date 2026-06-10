@@ -12,5 +12,6 @@
 #define TFS_ERR_NO_SPACE -7
 #define TFS_ERR_BAD_FD -8
 #define TFS_ERR_EOF -9
+#define TFS_ERR_READ_ONLY -10
 
 #endif

@@ -18,8 +18,10 @@ static void readWholeFile(fileDescriptor fd) {
 int main(void) {
     int result;
     fileDescriptor fd;
+    fileDescriptor bigFd;
     char message[] = "hello tiny file system";
     char newMessage[] = "new writable content";
+    char bigBuffer[600];
 
     printf("Creating TinyFS disk...\n");
     result = tfs_mkfs(DEFAULT_DISK_NAME, DEFAULT_DISK_SIZE);
@@ -117,8 +119,63 @@ int main(void) {
     printf("Reading new file1 should be empty: ");
     readWholeFile(fd);
 
-    printf("Directory listing after reopening file1:\n");
+    printf("Writing to file1 again: %s\n", message);
+    result = tfs_writeFile(fd, message, strlen(message));
+    if (result < 0) {
+        printf("tfs_writeFile failed: %d\n", result);
+        return 1;
+    }
+
+    printf("Overwriting first byte of file1 with 'H' via tfs_writeByte...\n");
+    tfs_seek(fd, 0);
+    result = tfs_writeByte(fd, 'H');
+    if (result < 0) {
+        printf("tfs_writeByte failed: %d\n", result);
+        return 1;
+    }
+
+    printf("Reading after writeByte: ");
+    readWholeFile(fd);
+
+    printf("Making file1 read-only and trying tfs_writeByte...\n");
+    tfs_makeRO("file1");
+    tfs_seek(fd, 0);
+    result = tfs_writeByte(fd, 'x');
+    printf("writeByte result while read-only should be negative: %d\n", result);
+    tfs_makeRW("file1");
+
+    printf("Writing a 600 byte file to show multi-block chaining...\n");
+    for (int i = 0; i < 600; i++) {
+        bigBuffer[i] = 'a' + (i % 26);
+    }
+
+    bigFd = tfs_openFile("bigfile");
+    if (bigFd < 0) {
+        printf("tfs_openFile failed for bigfile: %d\n", bigFd);
+        return 1;
+    }
+
+    result = tfs_writeFile(bigFd, bigBuffer, 600);
+    if (result < 0) {
+        printf("tfs_writeFile failed for bigfile: %d\n", result);
+        return 1;
+    }
+
+    printf("Reading bigfile back:\n");
+    readWholeFile(bigFd);
+
+    printf("Opening file with the longest legal name (8 chars)...\n");
+    result = tfs_openFile("file5678");
+    if (result < 0) {
+        printf("tfs_openFile failed for file5678: %d\n", result);
+        return 1;
+    }
+    tfs_closeFile(result);
+
+    printf("Directory listing at the end:\n");
     tfs_readdir();
+
+    tfs_closeFile(bigFd);
 
     result = tfs_closeFile(fd);
     if (result < 0) {

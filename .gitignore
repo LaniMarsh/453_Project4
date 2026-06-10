@@ -1,0 +1,9 @@
+*.o
+libDiskTest
+tinyFSDemo
+tinyFSTest
+test.disk
+tinyFSDisk
+testDisk
+junkDisk
+smallDsk
