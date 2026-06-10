@@ -19,8 +19,10 @@ int main(void) {
     int result;
     fileDescriptor fd;
     fileDescriptor bigFd;
+    fileDescriptor memoFd;
     char message[] = "hello tiny file system";
     char newMessage[] = "new writable content";
+    char memo[] = "memo in a nested dir";
     char bigBuffer[600];
 
     printf("Creating TinyFS disk...\n");
@@ -172,7 +174,55 @@ int main(void) {
     }
     tfs_closeFile(result);
 
-    printf("Directory listing at the end:\n");
+    printf("Creating directories /docs and /docs/notes...\n");
+    result = tfs_createDir("docs");
+    if (result < 0) {
+        printf("tfs_createDir failed for docs: %d\n", result);
+        return 1;
+    }
+
+    result = tfs_createDir("/docs/notes");
+    if (result < 0) {
+        printf("tfs_createDir failed for /docs/notes: %d\n", result);
+        return 1;
+    }
+
+    printf("Writing %s to /docs/notes/memo...\n", memo);
+    memoFd = tfs_openFile("/docs/notes/memo");
+    if (memoFd < 0) {
+        printf("tfs_openFile failed for /docs/notes/memo: %d\n", memoFd);
+        return 1;
+    }
+
+    result = tfs_writeFile(memoFd, memo, strlen(memo));
+    if (result < 0) {
+        printf("tfs_writeFile failed for memo: %d\n", result);
+        return 1;
+    }
+
+    printf("Reading /docs/notes/memo: ");
+    readWholeFile(memoFd);
+
+    printf("Opening a file in a missing directory should fail...\n");
+    result = tfs_openFile("/nosuch/file");
+    printf("Open result for missing directory should be negative: %d\n", result);
+
+    printf("Directory listing with the tree:\n");
+    tfs_readdir();
+
+    printf("Removing non-empty /docs should fail...\n");
+    result = tfs_removeDir("/docs");
+    printf("removeDir result for non-empty dir should be negative: %d\n", result);
+
+    printf("Recursively removing /docs with tfs_removeAll...\n");
+    tfs_closeFile(memoFd);
+    result = tfs_removeAll("/docs");
+    if (result < 0) {
+        printf("tfs_removeAll failed: %d\n", result);
+        return 1;
+    }
+
+    printf("Directory listing after removeAll:\n");
     tfs_readdir();
 
     tfs_closeFile(bigFd);

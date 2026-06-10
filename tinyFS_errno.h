@@ -13,5 +13,8 @@
 #define TFS_ERR_BAD_FD -8
 #define TFS_ERR_EOF -9
 #define TFS_ERR_READ_ONLY -10
+#define TFS_ERR_NO_DIR -11
+#define TFS_ERR_NOT_EMPTY -12
+#define TFS_ERR_IS_DIR -13
 
 #endif

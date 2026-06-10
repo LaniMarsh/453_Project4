@@ -157,6 +157,49 @@ int main(void) {
     check(tfs_writeFile(fd2, "abc", 3) == TFS_ERR_BAD_FD, "stale FD cannot write after delete");
     check(tfs_readByte(fd2, &c) == TFS_ERR_BAD_FD, "stale FD cannot read after delete");
 
+    /* hierarchical directories */
+    check(tfs_createDir("dirA") == TFS_SUCCESS, "createDir in root succeeds");
+    check(tfs_createDir("dirA") < 0, "createDir fails when name already exists");
+    check(tfs_createDir("nodir/sub") == TFS_ERR_NO_DIR, "createDir fails when parent is missing");
+    check(tfs_createDir("/dirA/sub") == TFS_SUCCESS, "nested createDir succeeds");
+
+    check(tfs_openFile("/nodir/file") == TFS_ERR_NO_DIR, "openFile fails when directory is missing");
+    check(tfs_openFile("dirA") == TFS_ERR_IS_DIR, "openFile rejects a directory");
+
+    fd = tfs_openFile("/dirA/sub/deep");
+    check(fd >= 0, "openFile creates file in nested directory");
+    check(tfs_writeFile(fd, "nested", 6) == TFS_SUCCESS, "write to nested file succeeds");
+
+    fd2 = tfs_openFile("dirA/sub/deep");
+    count = readAll(fd2, readBuffer, 2048);
+    check(count == 6 && memcmp(readBuffer, "nested", 6) == 0, "path works with or without leading slash");
+    tfs_closeFile(fd2);
+
+    /* the same name can live in different directories */
+    fd2 = tfs_openFile("/dirA/big");
+    check(fd2 >= 0, "name reused in another directory");
+    check(tfs_writeFile(fd2, "other", 5) == TFS_SUCCESS, "write to reused name succeeds");
+    tfs_closeFile(fd2);
+
+    fd2 = tfs_openFile("big");
+    count = readAll(fd2, readBuffer, 2048);
+    check(count == 4 && memcmp(readBuffer, "tiny", 4) == 0, "root file untouched by same name in subdir");
+    tfs_closeFile(fd2);
+
+    check(tfs_removeDir("/dirA") == TFS_ERR_NOT_EMPTY, "removeDir fails on non-empty directory");
+    check(tfs_removeDir("big") == TFS_ERR_NO_DIR, "removeDir rejects a file");
+
+    check(tfs_deleteFile(fd) == TFS_SUCCESS, "delete nested file succeeds");
+    fd = tfs_openFile("/dirA/sub/deep");
+    count = readAll(fd, readBuffer, 2048);
+    check(count == 0, "deleted nested file is gone from its directory");
+
+    /* removeAll tears the whole tree down and invalidates open FDs */
+    check(tfs_removeAll("/dirA") == TFS_SUCCESS, "removeAll removes directory tree");
+    check(tfs_readByte(fd, &c) == TFS_ERR_BAD_FD, "FD inside removed tree is invalidated");
+    check(tfs_openFile("dirA/big") == TFS_ERR_NO_DIR, "removed directory is gone");
+    check(tfs_removeDir("/dirA") == TFS_ERR_NO_DIR, "removeDir fails on removed directory");
+
     /* content survives unmount and remount */
     fd = tfs_openFile("persist");
     tfs_writeFile(fd, "persistent data", 15);
@@ -166,6 +209,14 @@ int main(void) {
     fd = tfs_openFile("persist");
     count = readAll(fd, readBuffer, 2048);
     check(count == 15 && memcmp(readBuffer, "persistent data", 15) == 0, "content survived remount");
+    tfs_closeFile(fd);
+
+    /* removeAll on "/" empties the disk but the root stays usable */
+    check(tfs_removeAll("/") == TFS_SUCCESS, "removeAll on root succeeds");
+    fd = tfs_openFile("persist");
+    count = readAll(fd, readBuffer, 2048);
+    check(fd >= 0 && count == 0, "old files are gone after wiping root");
+    check(tfs_createDir("fresh") == TFS_SUCCESS, "createDir works after wiping root");
     tfs_closeFile(fd);
     tfs_unmount();
 
@@ -181,7 +232,7 @@ int main(void) {
     check(count == 5 && memcmp(readBuffer, "hello", 5) == 0, "small file readable after failed write");
 
     /* fill the disk completely, then free it again */
-    check(tfs_writeFile(fd, bigBuffer, 1500) == TFS_SUCCESS, "write filling every free block succeeds");
+    check(tfs_writeFile(fd, bigBuffer, 1200) == TFS_SUCCESS, "write filling every free block succeeds");
     check(tfs_openFile("full2") == TFS_ERR_NO_SPACE, "openFile fails when disk is full");
     check(tfs_deleteFile(fd) == TFS_SUCCESS, "delete frees the blocks");
     fd2 = tfs_openFile("full2");

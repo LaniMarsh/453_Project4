@@ -29,6 +29,9 @@ int tfs_readdir(void);
 int tfs_rename(fileDescriptor FD, char *newName);
 int tfs_makeRO(char *name);
 int tfs_makeRW(char *name);
+int tfs_createDir(char *dirName);
+int tfs_removeDir(char *dirName);
+int tfs_removeAll(char *dirName);
 
 fileDescriptor tfs_openFile(char *name);
 int tfs_closeFile(fileDescriptor FD);

@@ -6,9 +6,13 @@
 
 /*
  * On-disk layout:
- *   superblock (block 0): byte 2 holds the head of the free block chain
+ *   superblock (block 0): byte 2 holds the head of the free block chain,
+ *          byte 4 holds the block number of the root directory inode
  *   inode: name at bytes 4-12 (8 chars + NUL), size at 16, first data
- *          block at 20, read-only flag at 24
+ *          block at 20, read-only flag at 24, directory flag at 25,
+ *          parent directory block at 26
+ *   directory inodes store one byte per child inode block starting at
+ *          byte 32, so they never need data blocks
  *   data block: byte 2 links to the next data block of the file
  *   free block: byte 2 links to the next free block
  */
@@ -17,11 +21,17 @@
 #define MAX_FILENAME 8
 #define NO_BLOCK 0
 
+#define SUPER_ROOT 4
+
 /* name field needs MAX_FILENAME + 1 bytes so an 8 char name keeps its NUL */
 #define INODE_NAME_START 4
 #define INODE_SIZE_START 16
 #define INODE_DATA_START 20
 #define INODE_RO_FLAG 24
+#define INODE_DIR_FLAG 25
+#define INODE_PARENT 26
+
+#define DIR_ENTRIES_START 32
 
 #define DATA_BYTES_PER_BLOCK 252
 
@@ -33,6 +43,7 @@ typedef struct {
 
 static int mountedDisk = -1;
 static int isMounted = 0;
+static int rootBlock = -1;
 static OpenFileEntry openFiles[MAX_OPEN_FILES];
 
 static void clearBlock(char block[BLOCKSIZE]) {
@@ -99,6 +110,10 @@ static int isReadOnly(char inode[BLOCKSIZE]) {
 
 static void setReadOnly(char inode[BLOCKSIZE], int value) {
     inode[INODE_RO_FLAG] = value;
+}
+
+static int isDirectory(char inode[BLOCKSIZE]) {
+    return inode[INODE_DIR_FLAG] == 1;
 }
 
 /* pops the first block off the free chain and returns its block number */
@@ -182,22 +197,246 @@ static int freeDataBlocks(int firstDataBlock) {
     return TFS_SUCCESS;
 }
 
-/* scans every block for an inode whose name matches, returns its block number */
-static int findInodeByName(char *name) {
-    char block[BLOCKSIZE];
+/* searches a directory's entry table for a child with the given name,
+   returns the child's inode block number */
+static int findInDir(int dirBlock, char *name) {
+    char dir[BLOCKSIZE];
+    char inode[BLOCKSIZE];
+    int child;
 
-    for (int i = 1; i < 256; i++) {
-        if (readBlock(mountedDisk, i, block) < 0) {
-            break;
+    if (readBlock(mountedDisk, dirBlock, dir) < 0) {
+        return TFS_ERR_DISK;
+    }
+
+    for (int i = DIR_ENTRIES_START; i < BLOCKSIZE; i++) {
+        child = (unsigned char)dir[i];
+
+        if (child == NO_BLOCK) {
+            continue;
         }
 
-        if ((unsigned char)block[BYTE_TYPE] == BLOCK_INODE &&
-            strcmp(&block[INODE_NAME_START], name) == 0) {
-            return i;
+        if (readBlock(mountedDisk, child, inode) < 0) {
+            return TFS_ERR_DISK;
+        }
+
+        if (strcmp(&inode[INODE_NAME_START], name) == 0) {
+            return child;
         }
     }
 
     return TFS_ERR_GENERAL;
+}
+
+static int addDirEntry(int dirBlock, int childBlock) {
+    char dir[BLOCKSIZE];
+
+    if (readBlock(mountedDisk, dirBlock, dir) < 0) {
+        return TFS_ERR_DISK;
+    }
+
+    for (int i = DIR_ENTRIES_START; i < BLOCKSIZE; i++) {
+        if ((unsigned char)dir[i] == NO_BLOCK) {
+            dir[i] = childBlock;
+
+            if (writeBlock(mountedDisk, dirBlock, dir) < 0) {
+                return TFS_ERR_DISK;
+            }
+
+            return TFS_SUCCESS;
+        }
+    }
+
+    return TFS_ERR_NO_SPACE;
+}
+
+static int removeDirEntry(int dirBlock, int childBlock) {
+    char dir[BLOCKSIZE];
+
+    if (readBlock(mountedDisk, dirBlock, dir) < 0) {
+        return TFS_ERR_DISK;
+    }
+
+    for (int i = DIR_ENTRIES_START; i < BLOCKSIZE; i++) {
+        if ((unsigned char)dir[i] == childBlock) {
+            dir[i] = NO_BLOCK;
+
+            if (writeBlock(mountedDisk, dirBlock, dir) < 0) {
+                return TFS_ERR_DISK;
+            }
+
+            return TFS_SUCCESS;
+        }
+    }
+
+    return TFS_ERR_GENERAL;
+}
+
+static int dirIsEmpty(char inode[BLOCKSIZE]) {
+    for (int i = DIR_ENTRIES_START; i < BLOCKSIZE; i++) {
+        if ((unsigned char)inode[i] != NO_BLOCK) {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+/* walks a "/" separated absolute path down from the root directory and
+   returns the block of the directory that should hold the final
+   component, which is copied into lastName; fails if any directory
+   along the way is missing */
+static int resolveParentDir(char *path, char *lastName) {
+    char inode[BLOCKSIZE];
+    char component[MAX_FILENAME + 1];
+    int current;
+    int next;
+    int len;
+
+    if (path == NULL) {
+        return TFS_ERR_BAD_NAME;
+    }
+
+    if (*path == '/') {
+        path++;
+    }
+
+    if (*path == '\0') {
+        return TFS_ERR_BAD_NAME;
+    }
+
+    current = rootBlock;
+
+    while (1) {
+        len = 0;
+
+        while (path[len] != '\0' && path[len] != '/') {
+            if (len >= MAX_FILENAME) {
+                return TFS_ERR_BAD_NAME;
+            }
+
+            component[len] = path[len];
+            len++;
+        }
+
+        component[len] = '\0';
+
+        if (!isValidName(component)) {
+            return TFS_ERR_BAD_NAME;
+        }
+
+        if (path[len] == '\0') {
+            strcpy(lastName, component);
+            return current;
+        }
+
+        next = findInDir(current, component);
+
+        if (next < 0) {
+            return TFS_ERR_NO_DIR;
+        }
+
+        if (readBlock(mountedDisk, next, inode) < 0) {
+            return TFS_ERR_DISK;
+        }
+
+        if (!isDirectory(inode)) {
+            return TFS_ERR_NO_DIR;
+        }
+
+        current = next;
+        path += len + 1;
+    }
+}
+
+/* resolves a full path to an inode block number */
+static int lookupPath(char *path) {
+    char lastName[MAX_FILENAME + 1];
+    int parentBlock;
+
+    parentBlock = resolveParentDir(path, lastName);
+
+    if (parentBlock < 0) {
+        return parentBlock;
+    }
+
+    return findInDir(parentBlock, lastName);
+}
+
+/* allocates a fresh inode, links it into its parent directory and
+   returns its block number */
+static int createInode(int parentBlock, char *name, int isDir) {
+    char inode[BLOCKSIZE];
+    int inodeBlock;
+    int result;
+
+    inodeBlock = getFreeBlock();
+
+    if (inodeBlock < 0) {
+        return inodeBlock;
+    }
+
+    initBlock(inode, BLOCK_INODE);
+
+    strcpy(&inode[INODE_NAME_START], name);
+    setFileSize(inode, 0);
+    setFirstDataBlock(inode, NO_BLOCK);
+    setReadOnly(inode, 0);
+    inode[INODE_DIR_FLAG] = isDir ? 1 : 0;
+    inode[INODE_PARENT] = parentBlock;
+
+    if (writeBlock(mountedDisk, inodeBlock, inode) < 0) {
+        return TFS_ERR_DISK;
+    }
+
+    result = addDirEntry(parentBlock, inodeBlock);
+
+    if (result < 0) {
+        returnBlockToFreeList(inodeBlock);
+        return result;
+    }
+
+    return inodeBlock;
+}
+
+/* closes every open descriptor that points at the given inode */
+static void closeDescriptorsFor(int inodeBlock) {
+    for (int i = 0; i < MAX_OPEN_FILES; i++) {
+        if (openFiles[i].inUse && openFiles[i].inodeBlock == inodeBlock) {
+            openFiles[i].inUse = 0;
+            openFiles[i].inodeBlock = -1;
+            openFiles[i].filePointer = 0;
+        }
+    }
+}
+
+/* recursively frees a file or directory tree rooted at inodeBlock */
+static int removeTree(int inodeBlock) {
+    char inode[BLOCKSIZE];
+    int child;
+
+    if (readBlock(mountedDisk, inodeBlock, inode) < 0) {
+        return TFS_ERR_DISK;
+    }
+
+    if (isDirectory(inode)) {
+        for (int i = DIR_ENTRIES_START; i < BLOCKSIZE; i++) {
+            child = (unsigned char)inode[i];
+
+            if (child != NO_BLOCK) {
+                if (removeTree(child) < 0) {
+                    return TFS_ERR_DISK;
+                }
+            }
+        }
+    } else {
+        if (freeDataBlocks(getFirstDataBlock(inode)) < 0) {
+            return TFS_ERR_DISK;
+        }
+    }
+
+    closeDescriptorsFor(inodeBlock);
+
+    return returnBlockToFreeList(inodeBlock);
 }
 
 static int getOpenFileSlot(void) {
@@ -234,8 +473,10 @@ int tfs_mkfs(char *filename, int nBytes) {
 
     initBlock(block, BLOCK_SUPER);
 
-    if (totalBlocks > 1) {
-        block[BYTE_LINK] = 1;
+    block[SUPER_ROOT] = 1;
+
+    if (totalBlocks > 2) {
+        block[BYTE_LINK] = 2;
     }
 
     if (writeBlock(disk, 0, block) < 0) {
@@ -243,7 +484,16 @@ int tfs_mkfs(char *filename, int nBytes) {
         return TFS_ERR_DISK;
     }
 
-    for (int i = 1; i < totalBlocks; i++) {
+    /* block 1 is the root directory inode */
+    initBlock(block, BLOCK_INODE);
+    block[INODE_DIR_FLAG] = 1;
+
+    if (writeBlock(disk, 1, block) < 0) {
+        closeDisk(disk);
+        return TFS_ERR_DISK;
+    }
+
+    for (int i = 2; i < totalBlocks; i++) {
         initBlock(block, BLOCK_FREE);
 
         if (i + 1 < totalBlocks) {
@@ -291,6 +541,17 @@ int tfs_mount(char *diskname) {
         return TFS_ERR_BAD_FS;
     }
 
+    rootBlock = (unsigned char)block[SUPER_ROOT];
+
+    if (rootBlock == NO_BLOCK ||
+        readBlock(disk, rootBlock, block) < 0 ||
+        (unsigned char)block[BYTE_TYPE] != BLOCK_INODE ||
+        !isDirectory(block)) {
+        closeDisk(disk);
+        rootBlock = -1;
+        return TFS_ERR_BAD_FS;
+    }
+
     mountedDisk = disk;
     isMounted = 1;
 
@@ -314,12 +575,17 @@ int tfs_unmount(void) {
 
     mountedDisk = -1;
     isMounted = 0;
+    rootBlock = -1;
 
     return TFS_SUCCESS;
 }
 
+/* name may be a plain file name (placed in the root directory) or a
+   "/" separated absolute path; every directory in the path must exist */
 fileDescriptor tfs_openFile(char *name) {
     char inode[BLOCKSIZE];
+    char lastName[MAX_FILENAME + 1];
+    int parentBlock;
     int inodeBlock;
     int fd;
 
@@ -327,28 +593,27 @@ fileDescriptor tfs_openFile(char *name) {
         return TFS_ERR_NOT_MOUNTED;
     }
 
-    if (!isValidName(name)) {
-        return TFS_ERR_BAD_NAME;
+    parentBlock = resolveParentDir(name, lastName);
+
+    if (parentBlock < 0) {
+        return parentBlock;
     }
 
-    inodeBlock = findInodeByName(name);
+    inodeBlock = findInDir(parentBlock, lastName);
 
-    if (inodeBlock < 0) {
-        inodeBlock = getFreeBlock();
+    if (inodeBlock >= 0) {
+        if (readBlock(mountedDisk, inodeBlock, inode) < 0) {
+            return TFS_ERR_DISK;
+        }
+
+        if (isDirectory(inode)) {
+            return TFS_ERR_IS_DIR;
+        }
+    } else {
+        inodeBlock = createInode(parentBlock, lastName, 0);
 
         if (inodeBlock < 0) {
             return inodeBlock;
-        }
-
-        initBlock(inode, BLOCK_INODE);
-
-        strcpy(&inode[INODE_NAME_START], name);
-        setFileSize(inode, 0);
-        setFirstDataBlock(inode, NO_BLOCK);
-        setReadOnly(inode, 0);
-
-        if (writeBlock(mountedDisk, inodeBlock, inode) < 0) {
-            return TFS_ERR_DISK;
         }
     }
 
@@ -521,19 +786,17 @@ int tfs_deleteFile(fileDescriptor FD) {
         return TFS_ERR_DISK;
     }
 
+    if (removeDirEntry((unsigned char)inode[INODE_PARENT], inodeBlock) < 0) {
+        return TFS_ERR_DISK;
+    }
+
     if (returnBlockToFreeList(inodeBlock) < 0) {
         return TFS_ERR_DISK;
     }
 
     /* the same file may be open under several descriptors, so close
        every entry that points at the freed inode */
-    for (int i = 0; i < MAX_OPEN_FILES; i++) {
-        if (openFiles[i].inUse && openFiles[i].inodeBlock == inodeBlock) {
-            openFiles[i].inUse = 0;
-            openFiles[i].inodeBlock = -1;
-            openFiles[i].filePointer = 0;
-        }
-    }
+    closeDescriptorsFor(inodeBlock);
 
     return TFS_SUCCESS;
 }
@@ -625,28 +888,52 @@ int tfs_seek(fileDescriptor FD, int offset) {
     return TFS_SUCCESS;
 }
 
-int tfs_readdir(void) {
-    char block[BLOCKSIZE];
-    int foundAny = 0;
+/* prints every entry under dirBlock with its absolute path, returns the
+   number of entries printed */
+static int printDirTree(int dirBlock, char *path) {
+    char dir[BLOCKSIZE];
+    char inode[BLOCKSIZE];
+    char childPath[256];
+    int child;
+    int count = 0;
 
+    if (readBlock(mountedDisk, dirBlock, dir) < 0) {
+        return 0;
+    }
+
+    for (int i = DIR_ENTRIES_START; i < BLOCKSIZE; i++) {
+        child = (unsigned char)dir[i];
+
+        if (child == NO_BLOCK) {
+            continue;
+        }
+
+        if (readBlock(mountedDisk, child, inode) < 0) {
+            continue;
+        }
+
+        snprintf(childPath, sizeof(childPath), "%s/%s", path, &inode[INODE_NAME_START]);
+
+        if (isDirectory(inode)) {
+            printf("  %s/\n", childPath);
+            count += 1 + printDirTree(child, childPath);
+        } else {
+            printf("  %s\n", childPath);
+            count++;
+        }
+    }
+
+    return count;
+}
+
+int tfs_readdir(void) {
     if (!isMounted) {
         return TFS_ERR_NOT_MOUNTED;
     }
 
     printf("Files on TinyFS disk:\n");
 
-    for (int i = 1; i < 256; i++) {
-        if (readBlock(mountedDisk, i, block) < 0) {
-            break;
-        }
-
-        if ((unsigned char)block[BYTE_TYPE] == BLOCK_INODE) {
-            printf("  %s\n", &block[INODE_NAME_START]);
-            foundAny = 1;
-        }
-    }
-
-    if (!foundAny) {
+    if (printDirTree(rootBlock, "") == 0) {
         printf("  <empty>\n");
     }
 
@@ -668,16 +955,17 @@ int tfs_rename(fileDescriptor FD, char *newName) {
         return TFS_ERR_BAD_NAME;
     }
 
-    if (findInodeByName(newName) >= 0) {
-        return TFS_ERR_GENERAL;
-    }
-
     if (readBlock(mountedDisk, openFiles[FD].inodeBlock, inode) < 0) {
         return TFS_ERR_DISK;
     }
 
     if ((unsigned char)inode[BYTE_TYPE] != BLOCK_INODE) {
         return TFS_ERR_BAD_FD;
+    }
+
+    /* the new name only has to be unique within the file's directory */
+    if (findInDir((unsigned char)inode[INODE_PARENT], newName) >= 0) {
+        return TFS_ERR_GENERAL;
     }
 
     memset(&inode[INODE_NAME_START], 0, MAX_FILENAME + 1);
@@ -698,14 +986,10 @@ int tfs_makeRO(char *name) {
         return TFS_ERR_NOT_MOUNTED;
     }
 
-    if (!isValidName(name)) {
-        return TFS_ERR_BAD_NAME;
-    }
-
-    inodeBlock = findInodeByName(name);
+    inodeBlock = lookupPath(name);
 
     if (inodeBlock < 0) {
-        return TFS_ERR_GENERAL;
+        return inodeBlock;
     }
 
     if (readBlock(mountedDisk, inodeBlock, inode) < 0) {
@@ -729,14 +1013,10 @@ int tfs_makeRW(char *name) {
         return TFS_ERR_NOT_MOUNTED;
     }
 
-    if (!isValidName(name)) {
-        return TFS_ERR_BAD_NAME;
-    }
-
-    inodeBlock = findInodeByName(name);
+    inodeBlock = lookupPath(name);
 
     if (inodeBlock < 0) {
-        return TFS_ERR_GENERAL;
+        return inodeBlock;
     }
 
     if (readBlock(mountedDisk, inodeBlock, inode) < 0) {
@@ -822,4 +1102,139 @@ int tfs_writeByte(fileDescriptor FD, unsigned int data) {
     openFiles[FD].filePointer++;
 
     return TFS_SUCCESS;
+}
+
+/* creates a directory; every directory above it in the path must exist */
+int tfs_createDir(char *dirName) {
+    char lastName[MAX_FILENAME + 1];
+    int parentBlock;
+    int inodeBlock;
+
+    if (!isMounted) {
+        return TFS_ERR_NOT_MOUNTED;
+    }
+
+    parentBlock = resolveParentDir(dirName, lastName);
+
+    if (parentBlock < 0) {
+        return parentBlock;
+    }
+
+    if (findInDir(parentBlock, lastName) >= 0) {
+        return TFS_ERR_GENERAL;
+    }
+
+    inodeBlock = createInode(parentBlock, lastName, 1);
+
+    if (inodeBlock < 0) {
+        return inodeBlock;
+    }
+
+    return TFS_SUCCESS;
+}
+
+/* removes a directory, which must be empty */
+int tfs_removeDir(char *dirName) {
+    char inode[BLOCKSIZE];
+    char lastName[MAX_FILENAME + 1];
+    int parentBlock;
+    int dirBlock;
+
+    if (!isMounted) {
+        return TFS_ERR_NOT_MOUNTED;
+    }
+
+    parentBlock = resolveParentDir(dirName, lastName);
+
+    if (parentBlock < 0) {
+        return parentBlock;
+    }
+
+    dirBlock = findInDir(parentBlock, lastName);
+
+    if (dirBlock < 0) {
+        return TFS_ERR_NO_DIR;
+    }
+
+    if (readBlock(mountedDisk, dirBlock, inode) < 0) {
+        return TFS_ERR_DISK;
+    }
+
+    if (!isDirectory(inode)) {
+        return TFS_ERR_NO_DIR;
+    }
+
+    if (!dirIsEmpty(inode)) {
+        return TFS_ERR_NOT_EMPTY;
+    }
+
+    if (removeDirEntry(parentBlock, dirBlock) < 0) {
+        return TFS_ERR_DISK;
+    }
+
+    return returnBlockToFreeList(dirBlock);
+}
+
+/* recursively removes a directory and everything below it; "/" empties
+   the whole file system but keeps the root directory itself */
+int tfs_removeAll(char *dirName) {
+    char inode[BLOCKSIZE];
+    char lastName[MAX_FILENAME + 1];
+    int parentBlock;
+    int dirBlock;
+    int child;
+
+    if (!isMounted) {
+        return TFS_ERR_NOT_MOUNTED;
+    }
+
+    if (dirName != NULL && strcmp(dirName, "/") == 0) {
+        if (readBlock(mountedDisk, rootBlock, inode) < 0) {
+            return TFS_ERR_DISK;
+        }
+
+        for (int i = DIR_ENTRIES_START; i < BLOCKSIZE; i++) {
+            child = (unsigned char)inode[i];
+
+            if (child != NO_BLOCK) {
+                if (removeTree(child) < 0) {
+                    return TFS_ERR_DISK;
+                }
+
+                inode[i] = NO_BLOCK;
+            }
+        }
+
+        if (writeBlock(mountedDisk, rootBlock, inode) < 0) {
+            return TFS_ERR_DISK;
+        }
+
+        return TFS_SUCCESS;
+    }
+
+    parentBlock = resolveParentDir(dirName, lastName);
+
+    if (parentBlock < 0) {
+        return parentBlock;
+    }
+
+    dirBlock = findInDir(parentBlock, lastName);
+
+    if (dirBlock < 0) {
+        return TFS_ERR_NO_DIR;
+    }
+
+    if (readBlock(mountedDisk, dirBlock, inode) < 0) {
+        return TFS_ERR_DISK;
+    }
+
+    if (!isDirectory(inode)) {
+        return TFS_ERR_NO_DIR;
+    }
+
+    if (removeDirEntry(parentBlock, dirBlock) < 0) {
+        return TFS_ERR_DISK;
+    }
+
+    return removeTree(dirBlock);
 }
